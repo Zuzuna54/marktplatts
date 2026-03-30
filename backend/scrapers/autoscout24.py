@@ -14,15 +14,23 @@ from database import (
 
 logger = logging.getLogger(__name__)
 
-DELAY = 2.0  # Slightly slower than Marktplaats to avoid blocking
+DELAY = 2.0
 BASE_URL = "https://www.autoscout24.nl"
-INCREMENTAL_BUFFER = timedelta(hours=1)
+MAX_PAGES_PER_BRAND = 200  # AS24 caps at 200 pages per search
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
 }
+
+# Major brands to shard by — all under 4k each on AS24 NL
+BRANDS = [
+    "yamaha", "honda", "kawasaki", "bmw", "suzuki", "ducati",
+    "harley-davidson", "triumph", "ktm", "aprilia", "moto-guzzi",
+    "mv-agusta", "husqvarna", "royal-enfield", "piaggio", "indian",
+    "buell", "cfmoto", "benelli",
+]
 
 
 def _parse_int_from_str(s: str | None) -> int | None:
@@ -33,10 +41,8 @@ def _parse_int_from_str(s: str | None) -> int | None:
 
 
 def _parse_year(vehicle_details: list[dict]) -> int | None:
-    """Extract construction year from vehicleDetails (the 'calendar' icon entry)."""
     for detail in vehicle_details:
         if detail.get("iconName") == "calendar":
-            # Format: "08/2025" or "2025"
             val = detail.get("data", "")
             match = re.search(r"(\d{4})", val)
             return int(match.group(1)) if match else None
@@ -44,12 +50,8 @@ def _parse_year(vehicle_details: list[dict]) -> int | None:
 
 
 def _make_image_urls(raw_url: str) -> dict:
-    """Convert 250x188 thumbnail to medium (400x300) and large (800x600) URLs."""
     base = raw_url.rsplit("/", 1)[0]
-    return {
-        "medium": f"{base}/400x300.webp",
-        "large": f"{base}/800x600.webp",
-    }
+    return {"medium": f"{base}/400x300.webp", "large": f"{base}/800x600.webp"}
 
 
 def _parse_listing(item: dict) -> dict:
@@ -60,7 +62,6 @@ def _parse_listing(item: dict) -> dict:
     vehicle_details = item.get("vehicleDetails", [])
     raw_images = item.get("images", [])
 
-    # Parse price from formatted string "€ 13.999"
     price_str = price_data.get("priceFormatted", "")
     price_cents = None
     if price_str:
@@ -68,33 +69,24 @@ def _parse_listing(item: dict) -> dict:
         if price_match:
             price_cents = int(price_match.group()) * 100
 
-    # Parse mileage from "2.483 km"
     mileage_km = _parse_int_from_str(vehicle.get("mileageInKm"))
-
-    # Parse engine cc from "890 cm³"
     engine_cc = _parse_int_from_str(vehicle.get("engineDisplacementInCCM"))
-
-    # Parse year from vehicleDetails
     construction_year = _parse_year(vehicle_details)
 
-    # Build images list
-    images = [_make_image_urls(url) for url in raw_images[:20]]  # Cap at 20 images
+    images = [_make_image_urls(url) for url in raw_images[:20]]
     thumbnail_url = images[0]["large"] if images else None
 
-    # Build title from make + model + variant
     title_parts = [vehicle.get("make", ""), vehicle.get("model", "")]
     variant = vehicle.get("modelVersionInput") or vehicle.get("variant") or ""
     if variant:
         title_parts.append(variant)
     title = " ".join(p for p in title_parts if p).strip() or item.get("id", "Unknown")
 
-    # Item URL
     url_path = item.get("url", "")
     link = f"{BASE_URL}{url_path}" if url_path.startswith("/") else url_path
 
     item_id = f"as24_{item.get('crossReferenceId') or item.get('id', '')}"
-
-    seller_type = seller.get("type", "")  # "Dealer" or "Private"
+    seller_type = seller.get("type", "")
 
     return {
         "item_id": item_id,
@@ -119,7 +111,7 @@ def _parse_listing(item: dict) -> dict:
         "seller_name": seller.get("companyName") or seller.get("contactName"),
         "thumbnail_url": thumbnail_url,
         "link": link,
-        "post_date": None,  # AutoScout24 doesn't expose post date in listing search
+        "post_date": None,
         "images": images,
         "source": "autoscout24",
         "is_auction": 0,
@@ -129,21 +121,19 @@ def _parse_listing(item: dict) -> dict:
     }
 
 
-def _fetch_page_sync(page: int) -> tuple[list[dict], int]:
-    """Fetch a single page. Returns (listings, total_count)."""
-    url = f"{BASE_URL}/lst-moto"
+def _fetch_page_sync(path: str, page: int) -> tuple[list[dict], int]:
+    """Fetch a single page for a given path. Returns (listings, total_count)."""
+    url = f"{BASE_URL}{path}"
     params = {"atype": "B", "cy": "NL", "sort": "standard", "page": str(page)}
 
     with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=15) as client:
         r = client.get(url, params=params)
 
     if r.status_code != 200:
-        logger.warning(f"AutoScout24 page {page}: HTTP {r.status_code}")
         return [], 0
 
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text)
     if not match:
-        logger.warning(f"AutoScout24 page {page}: no __NEXT_DATA__")
         return [], 0
 
     data = json.loads(match.group(1))
@@ -154,81 +144,104 @@ def _fetch_page_sync(page: int) -> tuple[list[dict], int]:
     return listings, total
 
 
+async def _fetch_all_pages(path: str, label: str) -> tuple[int, list[str]]:
+    """Paginate through all pages for a given search path. Returns (count, item_ids)."""
+    total_fetched = 0
+    all_item_ids: list[str] = []
+
+    for page in range(1, MAX_PAGES_PER_BRAND + 1):
+        try:
+            raw_listings, _ = await asyncio.to_thread(_fetch_page_sync, path, page)
+        except Exception as e:
+            logger.warning(f"[AutoScout24] Error {label} page {page}: {e}")
+            break
+
+        if not raw_listings:
+            break
+
+        parsed = []
+        for item in raw_listings:
+            try:
+                p = _parse_listing(item)
+                parsed.append(p)
+                all_item_ids.append(p["item_id"])
+            except Exception as e:
+                logger.warning(f"[AutoScout24] Parse error: {e}")
+
+        if parsed:
+            upsert_listings_bulk(parsed)
+
+        total_fetched += len(parsed)
+
+        if len(raw_listings) < 20:
+            break
+
+        await asyncio.sleep(DELAY)
+
+    return total_fetched, all_item_ids
+
+
 class AutoScout24Scraper(BaseScraper):
     source_id = "autoscout24"
     source_display = "AutoScout24"
 
     async def full_sync(self) -> int:
-        logger.info(f"[{self.source_display}] Starting full sync")
+        logger.info(f"[{self.source_display}] Starting full sync ({len(BRANDS)} brands)")
         grand_total = 0
-        page = 1
-        max_pages = 200
 
-        while page <= max_pages:
-            try:
-                raw_listings, total_count = await asyncio.to_thread(_fetch_page_sync, page)
-            except Exception as e:
-                logger.warning(f"[{self.source_display}] Error on page {page}: {e}", exc_info=True)
-                break
+        for i, brand in enumerate(BRANDS):
+            path = f"/lst-moto/{brand}"
+            logger.info(f"  [{self.source_display}] [{i + 1}/{len(BRANDS)}] {brand}")
 
-            if not raw_listings:
-                break
+            count, item_ids = await _fetch_all_pages(path, brand)
 
-            parsed = []
-            item_ids = []
-            for item in raw_listings:
-                try:
-                    p = _parse_listing(item)
-                    parsed.append(p)
-                    item_ids.append(p["item_id"])
-                except Exception as e:
-                    logger.warning(f"[{self.source_display}] Parse error: {e}")
+            if item_ids:
+                update_source_sync_date_from_listings(self.source_id, brand, item_ids)
 
-            if parsed:
-                upsert_listings_bulk(parsed)
-                update_source_sync_date_from_listings(self.source_id, "__all__", item_ids)
+            grand_total += count
+            db_total = count_listings()
+            update_sync_state(total_in_db=db_total)
+            logger.info(f"  [{self.source_display}] {brand}: {count} fetched (DB: {db_total:,})")
 
-            grand_total += len(parsed)
-
-            if page % 20 == 0:
-                db_total = count_listings()
-                update_sync_state(total_in_db=db_total, total_fetched=grand_total)
-                logger.info(f"  [{self.source_display}] Page {page}/{max_pages}: {grand_total} fetched")
-
-            page += 1
             await asyncio.sleep(DELAY)
 
-        logger.info(f"[{self.source_display}] Full sync done: {grand_total} listings")
+        # Catch remaining brands not in the list via the generic search
+        logger.info(f"  [{self.source_display}] Fetching remaining (generic)")
+        count, _ = await _fetch_all_pages("/lst-moto", "generic")
+        grand_total += count
+
+        logger.info(f"[{self.source_display}] Full sync done: {grand_total:,} listings")
         return grand_total
 
     async def incremental_sync(self) -> int:
-        """Fetch first few pages (newest listings) to catch new arrivals."""
-        # AutoScout24 doesn't support offered_since — just re-fetch the first ~10 pages
-        # which contain the newest listings. Dedup handles overlap.
+        """Re-fetch first few pages per brand to catch new arrivals."""
         grand_total = 0
-        max_pages = 10
 
-        for page in range(1, max_pages + 1):
-            try:
-                raw_listings, _ = await asyncio.to_thread(_fetch_page_sync, page)
-            except Exception as e:
-                logger.warning(f"[{self.source_display}] Incremental error page {page}: {e}")
-                break
+        for brand in BRANDS:
+            path = f"/lst-moto/{brand}"
+            total_fetched = 0
 
-            if not raw_listings:
-                break
-
-            parsed = []
-            for item in raw_listings:
+            for page in range(1, 6):  # First 5 pages per brand
                 try:
-                    parsed.append(_parse_listing(item))
-                except Exception as e:
-                    logger.warning(f"[{self.source_display}] Parse error: {e}")
+                    raw, _ = await asyncio.to_thread(_fetch_page_sync, path, page)
+                except Exception:
+                    break
+                if not raw:
+                    break
 
-            if parsed:
-                upsert_listings_bulk(parsed)
+                parsed = []
+                for item in raw:
+                    try:
+                        parsed.append(_parse_listing(item))
+                    except Exception:
+                        pass
+                if parsed:
+                    upsert_listings_bulk(parsed)
+                total_fetched += len(parsed)
+                await asyncio.sleep(DELAY)
 
-            grand_total += len(parsed)
-            await asyncio.sleep(DELAY)
+            grand_total += total_fetched
+            if total_fetched > 0:
+                logger.info(f"  [{self.source_display}] {brand}: {total_fetched} new/updated")
 
         return grand_total
